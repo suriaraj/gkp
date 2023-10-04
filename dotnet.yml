@@ -18,3 +18,20 @@
        reg query "HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\NET Framework Setup\NDP"
        reg query "HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\full" /v version
         
+tasks:
+   - name: CPM installation
+     win_command: cmd.exe /c E:\Guru\Cyberark\CPM_install\setup.exe 
+     args:
+      /q 
+      /norestart 
+      /log C:\temp\cpminstall\log.txt 
+      accepteula='yes' 
+      UserName='ExxonMobil'
+      Companyname='ExxonMobil' 
+      Installdir='F:\\Program Files (x86)\\CyberArk\\' 
+      isUpgrade="False" 
+      VaultIP='10.129.186.34' 
+      Vaultport='1858' 
+      Vaultuser='{{VAULT_USERNAME}}' 
+      VaultPassword='{{VAULT_PASSWORD}}'
+     register: cpm_install  
