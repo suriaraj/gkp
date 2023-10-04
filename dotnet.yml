@@ -35,3 +35,13 @@ tasks:
       Vaultuser='{{VAULT_USERNAME}}' 
       VaultPassword='{{VAULT_PASSWORD}}'
      register: cpm_install  
+
+---
+- name: CPM installation
+  hosts: your_windows_host
+  tasks:
+    - name: Run CPM Installer
+      win_command: cmd.exe /c "E:\Guru\Cyberark\CPM_install\setup.exe /q /norestart /log C:\temp\cpminstall\log.txt accepteula='yes' UserName='ExxonMobil' Companyname='ExxonMobil' Installdir='F:\\Program Files (x86)\\CyberArk\\' isUpgrade='False' VaultIP='10.129.186.34' Vaultport='1858' Vaultuser='{{ VAULT_USERNAME }}' VaultPassword='{{ VAULT_PASSWORD }}'"
+      register: cpm_install
+
+
