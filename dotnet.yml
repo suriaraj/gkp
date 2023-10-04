@@ -1,0 +1,20 @@
+---
+- hosts: all
+  gather_facts: yes
+  tasks:
+  - name: Copy Installer
+    win_copy:
+      src: ./files/dotnet.exe
+      dest: C:\temp\
+
+  - name: Run Microsoft .NET Framework 4.6.1 installer
+    raw: C:\temp\dotnet.exe /q /norestart /log C:\tmp\dotnet\dotnet461\log.txt /x86 /x64 /redist
+    register: dotnet_install
+
+  - name: Reboot as required by Microsoft .NET Framework 4.6.1 installer
+    win_reboot:
+  - name: check version
+    win_shell: |
+       reg query "HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\NET Framework Setup\NDP"
+       reg query "HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\full" /v version
+        
