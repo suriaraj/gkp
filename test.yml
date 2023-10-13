@@ -1,0 +1,31 @@
+---
+- name: DataDog Agent Install
+  hosts: localhost
+  gather_facts: false
+  tasks:    
+    - name: reading host and tags info from csv
+      read_csv:
+        path: ./files/ansibletest.csv
+      register: sources
+    - name: Grouping host and tags information
+      add_host:
+        name: "{{ item.hostname }}"
+        groups: hgroup
+        var1: "{{ item.hostname }}"
+        var2: "{{ item.tag }}"        
+      loop: "{{ sources.list }}"
+- name: list host details
+  hosts: hgroup
+  gather_facts: false
+  tasks:
+    - debug:
+        msg:
+          - "{{ var1 }}"
+          - "{{ var2 }}"
+- name: perform install to host group
+  hosts: hgroup
+  gather_facts: yes
+  tasks:
+   - name: Install Agent
+     win_shell: Start-Process -Wait msiexec -ArgumentList '/i  c:\temp\datadog-agent-7\datadog-agent-7-latest.amd64.msi /qn APIKEY="xxx" DDAGENTUSER_NAME="LocalSystem" HOSTNAME_FQDN_ENABLED="true" LOGS_ENABLED="true" PROCESS_ENABLED="true" TAGS="{{var2}}" ' }
+     loop: "{{ sources.list }}"
