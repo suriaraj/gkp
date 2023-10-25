@@ -7,13 +7,13 @@
       read_csv:
         path: ./files/ansibletest.csv
       register: sources
-    - name: Grouping host and tags information
-      add_host:
+    #- name: Grouping host and tags information
+    -  add_host:
         name: "{{ item.hostname }}"
         groups: hgroup
         var1: "{{ item.hostname }}"
         var2: "{{ item.tag }}"        
-      loop: "{{ sources.list }}"
+       loop: "{{ sources.list }}"
 - name: list host details
   hosts: hgroup
   gather_facts: false
@@ -26,6 +26,45 @@
   hosts: hgroup
   gather_facts: yes
   tasks:
-   - name: Install Agent
-     win_shell: Start-Process -Wait msiexec -ArgumentList '/i  c:\temp\datadog-agent-7\datadog-agent-7-latest.amd64.msi /qn APIKEY="xxx" DDAGENTUSER_NAME="LocalSystem" HOSTNAME_FQDN_ENABLED="true" LOGS_ENABLED="true" PROCESS_ENABLED="true" TAGS="{{var2}}" ' }
-     loop: "{{ sources.list }}"
+  - name: Check Previous DataDog Installation
+    win_shell: |
+       $dd = Get-ItemProperty 'HKLM:SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*' | Where DisplayName -like 'Datadog*' | Select-Object Displayname
+       $dd= $dd.Displayname
+       $dd
+    register: win_shell_result
+  - name: UnInstall agent
+    win_shell: start-process msiexec -Wait -ArgumentList ('/log', 'C:\uninst.log', '/q', '/x', (Get-CimInstance -ClassName Win32_Product -Filter "Name='Datadog Agent'" -ComputerName .).IdentifyingNumber, 'REBOOT=ReallySuppress')
+    register: win_shell_result
+    ignore_errors: yes
+    when: win_shell_result == "Datadog Agent"
+    
+  #Deleting ProgramData subfolder 
+  - name: Find Existing Datadog Agent ProgramData Folder
+    win_stat:
+      path: 'C:\\ProgramData\\Datadog\\'
+      #state: absent
+    register: PD_folder
+   
+  - name: Delete Existing Datadog Agent ProgramData Folder
+    win_file:
+      path: 'C:\\ProgramData\\Datadog\\'
+      state: absent
+    when: PD_folder.stat.exists == true
+    
+  #Deleting Temp folder subdirectory to ensure newly added informations are updated
+  - name: Delete Existing Datadog Agent Sub Directory
+    win_file:
+      path: 'C:\\Temp\\datadog-agent-7\\'
+      state: absent
+      
+  - name: Create Datadog Agent Sub Directory
+    win_file:
+      path: 'C:\\Temp\\datadog-agent-7\\'
+      state: directory
+    
+  - name: Copy agent
+    win_shell: Copy-Item "\\hoeapm21\Datadog\DatadogWindowsAgent\datadog-agent-7-latest.amd64.msi" -Destination "c:\temp\datadog-agent-7" -recurse -force
+  
+  - name: Install Agent
+    win_shell: Start-Process -Wait msiexec -ArgumentList '/i  c:\temp\datadog-agent-7\datadog-agent-7-latest.amd64.msi /qn APIKEY="615e91485d765c739254397a21c6722c" DDAGENTUSER_NAME="LocalSystem" HOSTNAME_FQDN_ENABLED="true" LOGS_ENABLED="true" PROCESS_ENABLED="true" TAGS="{{var2}}" ' }
+    loop: "{{ sources.list }}"
