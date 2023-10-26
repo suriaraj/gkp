@@ -66,5 +66,5 @@
     win_shell: Copy-Item "\\hoeapm21\Datadog\DatadogWindowsAgent\datadog-agent-7-latest.amd64.msi" -Destination "c:\temp\datadog-agent-7" -recurse -force
   
   - name: Install Agent
-    win_shell: Start-Process -Wait msiexec -ArgumentList '/i  c:\temp\datadog-agent-7\datadog-agent-7-latest.amd64.msi /qn APIKEY="615e91485d765c739254397a21c6722c" DDAGENTUSER_NAME="LocalSystem" HOSTNAME_FQDN_ENABLED="true" LOGS_ENABLED="true" PROCESS_ENABLED="true" TAGS="{{var2}}" ' }
+    win_shell: Start-Process -Wait msiexec -ArgumentList '/i  c:\temp\datadog-agent-7\datadog-agent-7-latest.amd64.msi /qn APIKEY="" DDAGENTUSER_NAME="LocalSystem" HOSTNAME_FQDN_ENABLED="true" LOGS_ENABLED="true" PROCESS_ENABLED="true" TAGS="{{var2}}" ' }
     loop: "{{ sources.list }}"
