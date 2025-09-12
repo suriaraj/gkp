@@ -1,0 +1,38 @@
+{
+  "function_app_name": "func-vcme-cloudreaper-qa",
+  "settings": {
+    "ENV": "qa",
+
+    "TABLE_NAME": "dbo.AssetCleanup",
+    "ID_FIELD": "id",
+    "VM_FIELD": "vmname",
+    "CAN_DELETE_FIELD": "can_be_deleted",
+    "IBCLEANUP_FIELD": "ibcleanup",
+    "DELETED_FIELD": "deleted",
+    "SNOW_TICKET_FIELD": "snow_ticket",
+
+    "AZURE_SQL_SERVER": "your-sql-server.database.windows.net",
+    "AZURE_SQL_DATABASE": "your-db",
+
+    "SNOW_BASE_URL": "https://your.instance.service-now.com",
+    "SNOW_MODE": "ritm",
+    "SNOW_TASK_CLOSE_STATE": "3",
+    "SNOW_RITM_CLOSE_STATE": "3",
+
+    "INFOBLOX_MODE": "real",
+    "INFOBLOX_BASE_URL": "https://infoblox.example.com",
+    "INFOBLOX_WAPI_VERSION": "v2.10",
+    "INFOBLOX_VERIFY_SSL": "true",
+
+    "AVD_MODE": "real",
+    "AZ_SUBSCRIPTION_ID": "00000000-0000-0000-0000-000000000000",
+    "AZ_RESOURCE_GROUP": "rg-cloudreaper-qa",
+
+    "ENTRA_MODE": "off",
+    "INTUNE_MODE": "off",
+
+    "NAME_SUFFIX_REGEX": "^(.*?)-(\\d+)$",
+    "NIC_FORMAT": "{base}-nic-{suffix}",
+    "OSDISK_FORMAT": "{base}-osdisk-{suffix}"
+  }
+}
