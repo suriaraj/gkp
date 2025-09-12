@@ -1,0 +1,430 @@
+# ib_cleanup_timer/__init__.py
+import os
+import json
+import re
+import logging
+import datetime
+from typing import Optional, Tuple, Dict, Any, List
+
+import azure.functions as func
+import pyodbc
+import requests
+
+from azure.identity import DefaultAzureCredential, ManagedIdentityCredential
+from azure.keyvault.secrets import SecretClient
+
+# ---------- Utilities & config ----------
+
+def get_env(name: str, default: Optional[str] = None, required: bool = False) -> str:
+    v = os.getenv(name, default)
+    if required and (v is None or v == ""):
+        raise RuntimeError(f"Missing required setting: {name}")
+    return v
+
+def as_bool(v: Optional[str], default=False) -> bool:
+    if v is None:
+        return default
+    return str(v).strip().lower() in ("1", "true", "yes", "y", "on")
+
+def target_mode(prefix: str) -> str:
+    # e.g. AVD_MODE, INFOBLOX_MODE, ENTRA_MODE, INTUNE_MODE
+    return get_env(f"{prefix.upper()}_MODE", "real").lower()  # real|mock|off
+
+# NIC/OSDisk name computation (supports any numeric suffix: -0, -00, -01, -123...)
+def compute_dep_names(vmname: str) -> Tuple[str, str]:
+    suffix_regex  = get_env("NAME_SUFFIX_REGEX", r"^(.*?)-(\d+)$")
+    nic_format    = get_env("NIC_FORMAT", "{base}-nic-{suffix}")
+    osdisk_format = get_env("OSDISK_FORMAT", "{base}-osdisk-{suffix}")
+    m = re.match(suffix_regex, vmname)
+    if m:
+        base, suffix = m.group(1), m.group(2)
+    else:
+        base, suffix = vmname, ""
+    nic_name    = nic_format.format(base=base, suffix=suffix)
+    osdisk_name = osdisk_format.format(base=base, suffix=suffix)
+    logging.info("Name compute: VM=%s -> NIC=%s, Disk=%s", vmname, nic_name, osdisk_name)
+    return nic_name, osdisk_name
+
+# ---------- Azure auth (UMI) & Key Vault ----------
+
+def get_default_credential():
+    # IMPORTANT for UMI: set AZURE_CLIENT_ID = <client_id of your user-assigned identity> in App Settings
+    # DefaultAzureCredential will then use that UMI automatically.
+    return DefaultAzureCredential(exclude_interactive_browser_credential=True)
+
+def kv_get_secret(kv_uri: Optional[str], name: str) -> Optional[str]:
+    if not kv_uri:
+        return None
+    try:
+        cred = get_default_credential()
+        client = SecretClient(vault_url=kv_uri, credential=cred)
+        return client.get_secret(name).value
+    except Exception as e:
+        logging.warning("KeyVault get secret failed for %s: %s", name, e)
+        return None
+
+# ---------- SQL via Managed Identity (UMI) ----------
+
+def sql_connect_msi() -> pyodbc.Connection:
+    server = get_env("AZURE_SQL_SERVER", required=True)          # e.g. myserver.database.windows.net
+    database = get_env("AZURE_SQL_DATABASE", required=True)      # e.g. mydb
+    # Acquire token for SQL
+    cred = get_default_credential()
+    token = cred.get_token("https://database.windows.net/.default").token
+    conn_str = (
+        "Driver={ODBC Driver 18 for SQL Server};"
+        f"Server=tcp:{server},1433;"
+        f"Database={database};"
+        "Encrypt=yes;TrustServerCertificate=no;Connection Timeout=30;"
+    )
+    # pyodbc expects a bytes token
+    token_bytes = bytes(token, "utf-8")
+    con = pyodbc.connect(conn_str, attrs_before={1256: token_bytes})
+    return con
+
+# ---------- ServiceNow (RITM-first) ----------
+
+class ServiceNowClient:
+    def __init__(self):
+        self.base = get_env("SNOW_BASE_URL", required=True).rstrip("/")
+        self.mode = get_env("SNOW_MODE", "ritm").lower()  # "ritm"
+        self.session = requests.Session()
+        self.session.headers.update({"Content-Type": "application/json"})
+        # Auth preference: OAuth bearer via KV, else basic
+        kv_uri = get_env("KEYVAULT_URI")
+        bearer = kv_get_secret(kv_uri, get_env("SECRET_SNOW_BEARER", "")) if kv_uri else None
+        if bearer:
+            self.session.headers.update({"Authorization": f"Bearer {bearer}"})
+        else:
+            user = get_env("SNOW_API_USER")
+            pwd = get_env("SNOW_API_PASSWORD")
+            if not (user and pwd):
+                raise RuntimeError("SNOW credentials missing")
+            self.session.auth = (user, pwd)
+
+    def create_ritm(self, short_description: str, description: str) -> Tuple[str, str]:
+        """
+        Creates a catalog item/producer RITM if SNOW_CATALOG_SYS_ID is provided,
+        otherwise falls back to direct sc_req_item insertion (less ideal).
+        Returns (ritm_sys_id, ritm_number)
+        """
+        cat_sys_id = get_env("SNOW_CATALOG_SYS_ID", "")
+        if cat_sys_id:
+            # Submit catalog producer
+            url = f"{self.base}/api/sn_sc/servicecatalog/items/{cat_sys_id}/submit_producer"
+            payload = {"variables": {"short_description": short_description, "description": description}}
+            r = self.session.post(url, data=json.dumps(payload))
+            r.raise_for_status()
+            data = r.json().get("result", {})
+            ritm_sys_id = data.get("request_item", {}).get("sys_id")
+            ritm_number = data.get("request_item", {}).get("number")
+        else:
+            # Fallback: insert into sc_req_item (minimal fields)
+            url = f"{self.base}/api/now/table/sc_req_item"
+            payload = {
+                "short_description": short_description,
+                "description": description,
+                "request_state": "requested"
+            }
+            r = self.session.post(url, data=json.dumps(payload))
+            r.raise_for_status()
+            res = r.json().get("result", {})
+            ritm_sys_id = res.get("sys_id")
+            ritm_number = res.get("number")
+        if not ritm_sys_id or not ritm_number:
+            raise RuntimeError("Failed to create RITM")
+        return ritm_sys_id, ritm_number
+
+    def get_tasks_for_ritm(self, ritm_sys_id: str) -> List[Dict[str, Any]]:
+        url = f"{self.base}/api/now/table/sc_task"
+        params = {"sysparm_query": f"request_item={ritm_sys_id}", "sysparm_limit": "50"}
+        r = self.session.get(url, params=params)
+        r.raise_for_status()
+        return r.json().get("result", [])
+
+    def add_work_note(self, table: str, sys_id: str, note: str) -> None:
+        url = f"{self.base}/api/now/table/{table}/{sys_id}"
+        payload = {"work_notes": note}
+        r = self.session.patch(url, data=json.dumps(payload))
+        r.raise_for_status()
+
+    def note(self, ritm_sys_id: str, note: str) -> None:
+        # Prefer writing to each SCTask if they exist; else attach to RITM
+        tasks = self.get_tasks_for_ritm(ritm_sys_id)
+        if tasks:
+            for t in tasks:
+                try:
+                    self.add_work_note("sc_task", t["sys_id"], note)
+                except Exception as e:
+                    logging.warning("Failed to add note to SCTask %s: %s", t.get("number"), e)
+        else:
+            self.add_work_note("sc_req_item", ritm_sys_id, note)
+
+    def close_tasks_and_ritm(self, ritm_sys_id: str, ok: bool) -> None:
+        task_close = get_env("SNOW_TASK_CLOSE_STATE", "3")  # 3=Closed Complete (example)
+        ritm_close = get_env("SNOW_RITM_CLOSE_STATE", "3")
+        # Close tasks
+        for t in self.get_tasks_for_ritm(ritm_sys_id):
+            try:
+                url = f"{self.base}/api/now/table/sc_task/{t['sys_id']}"
+                payload = {"state": task_close, "close_notes": "Auto-closed by CloudReaper"}
+                r = self.session.patch(url, data=json.dumps(payload)); r.raise_for_status()
+            except Exception as e:
+                logging.warning("Failed to close SCTask %s: %s", t.get("number"), e)
+        # Close RITM
+        try:
+            url = f"{self.base}/api/now/table/sc_req_item/{ritm_sys_id}"
+            payload = {"state": ritm_close, "close_notes": "All cleanup steps succeeded" if ok else "Cleanup incomplete"}
+            r = self.session.patch(url, data=json.dumps(payload)); r.raise_for_status()
+        except Exception as e:
+            logging.warning("Failed to close RITM: %s", e)
+
+# ---------- External steps ----------
+
+def do_infoblox(vmname: str, snow: Optional[ServiceNowClient], ritm_sys_id: Optional[str]) -> bool:
+    mode = target_mode("infoblox")  # real|mock|off
+    if mode == "off":
+        return True
+    if mode == "mock":
+        note = f"[Infoblox] MOCK delete success for {vmname}"
+        logging.info(note)
+        if snow and ritm_sys_id: snow.note(ritm_sys_id, note)
+        return True
+
+    base = get_env("INFOBLOX_BASE_URL", required=True).rstrip("/")
+    wapi_ver = get_env("INFOBLOX_WAPI_VERSION", "v2.10")
+    user = get_env("INFOBLOX_USER")
+    pwd  = get_env("INFOBLOX_PASSWORD")
+    kv_uri = get_env("KEYVAULT_URI")
+    if kv_uri:
+        user = user or kv_get_secret(kv_uri, get_env("SECRET_INFOBLOX_USER", ""))
+        pwd  = pwd  or kv_get_secret(kv_uri, get_env("SECRET_INFOBLOX_PASSWORD", ""))
+
+    s = requests.Session()
+    s.auth = (user, pwd) if user and pwd else None
+    s.verify = as_bool(get_env("INFOBLOX_VERIFY_SSL", "true"))
+
+    try:
+        # Example: search host record by name
+        url = f"{base}/wapi/{wapi_ver}/record:host"
+        r = s.get(url, params={"name": vmname}); r.raise_for_status()
+        results = r.json()
+        if not results:
+            note = f"[Infoblox] No record found for {vmname}; nothing to delete."
+            logging.info(note)
+            if snow and ritm_sys_id: snow.note(ritm_sys_id, note)
+            return True
+        # Delete each found object
+        for obj in results:
+            ref = obj.get("_ref")
+            if not ref: continue
+            del_url = f"{base}/wapi/{wapi_ver}/{ref}"
+            dr = s.delete(del_url); dr.raise_for_status()
+        note = f"[Infoblox] Deleted {len(results)} object(s) for {vmname}"
+        logging.info(note)
+        if snow and ritm_sys_id: snow.note(ritm_sys_id, note)
+        return True
+    except Exception as e:
+        err = f"[Infoblox] Delete failed for {vmname}: {e}"
+        logging.exception(err)
+        if snow and ritm_sys_id: snow.note(ritm_sys_id, err)
+        return False
+
+def do_avd(vmname: str, snow: Optional[ServiceNowClient], ritm_sys_id: Optional[str]) -> bool:
+    mode = target_mode("avd")
+    if mode == "off":
+        return True
+    if mode == "mock":
+        note = f"[AVD] MOCK cleanup success for {vmname}"
+        logging.info(note)
+        if snow and ritm_sys_id: snow.note(ritm_sys_id, note)
+        return True
+
+    sub = get_env("AZ_SUBSCRIPTION_ID", required=True)
+    rg  = get_env("AZ_RESOURCE_GROUP", required=True)
+
+    cred = get_default_credential()
+    token = cred.get_token("https://management.azure.com/.default").token
+    headers = {"Authorization": f"Bearer {token}"}
+
+    nic, disk = compute_dep_names(vmname)
+    base = f"https://management.azure.com/subscriptions/{sub}/resourceGroups/{rg}"
+    endpoints = [
+        (f"{base}/providers/Microsoft.Compute/virtualMachines/{vmname}?api-version=2023-03-01", "VM"),
+        (f"{base}/providers/Microsoft.Network/networkInterfaces/{nic}?api-version=2023-05-01", "NIC"),
+        (f"{base}/providers/Microsoft.Compute/disks/{disk}?api-version=2023-03-01", "Disk"),
+    ]
+
+    ok_all = True
+    for url, label in endpoints:
+        try:
+            r = requests.delete(url, headers=headers)
+            # ARM deletes can be async (202); treating 2xx as success
+            if r.status_code // 100 != 2:
+                raise RuntimeError(f"HTTP {r.status_code} {r.text[:300]}")
+            logging.info("[AVD] Delete queued OK: %s %s", label, url)
+            if snow and ritm_sys_id:
+                snow.note(ritm_sys_id, f"[AVD] Delete queued OK for {label} {vmname}")
+        except Exception as e:
+            ok_all = False
+            logging.exception("[AVD] Delete failed for %s: %s", label, e)
+            if snow and ritm_sys_id:
+                snow.note(ritm_sys_id, f"[AVD] Delete failed for {label}: {e}")
+
+    return ok_all
+
+def do_generic_rest(prefix: str, vmname: str, snow: Optional[ServiceNowClient], ritm_sys_id: Optional[str]) -> bool:
+    """
+    Generic REST target for ENTRA/INTUNE or any future target.
+    Config via:
+      <PREFIX>_MODE: real|mock|off
+      <PREFIX>_REST_URL
+      <PREFIX>_REST_METHOD (GET|POST|DELETE|PATCH|PUT)
+      <PREFIX>_REST_HEADERS_JSON
+      <PREFIX>_REST_BODY_TEMPLATE (supports {vmname})
+      <PREFIX>_AUTH: "aad_msi"|"bearer_static"|"none"
+      <PREFIX>_AAD_SCOPE or <PREFIX>_AAD_RESOURCE (for AAD MSI)
+      SECRET_<PREFIX>_BEARER (KeyVault secret name) if bearer_static
+    """
+    mode = target_mode(prefix)
+    up = prefix.upper()
+    if mode == "off":
+        return True
+    if mode == "mock":
+        note = f"[{up}] MOCK success for {vmname}"
+        logging.info(note)
+        if snow and ritm_sys_id: snow.note(ritm_sys_id, note)
+        return True
+
+    url = get_env(f"{up}_REST_URL", required=True)
+    method = get_env(f"{up}_REST_METHOD", "POST").upper()
+    headers = {}
+    hdr_json = get_env(f"{up}_REST_HEADERS_JSON", "")
+    if hdr_json:
+        try:
+            headers.update(json.loads(hdr_json))
+        except Exception:
+            logging.warning("[%s] Invalid headers JSON, ignoring", up)
+
+    body_tmpl = get_env(f"{up}_REST_BODY_TEMPLATE", "")
+    body = body_tmpl.format(vmname=vmname) if body_tmpl else None
+
+    auth_kind = get_env(f"{up}_AUTH", "none").lower()
+    if auth_kind == "aad_msi":
+        scope = get_env(f"{up}_AAD_SCOPE") or get_env(f"{up}_AAD_RESOURCE")
+        if not scope:
+            raise RuntimeError(f"[{up}] missing {up}_AAD_SCOPE or {up}_AAD_RESOURCE")
+        token = get_default_credential().get_token(scope if scope.endswith("/.default") else f"{scope}/.default").token
+        headers["Authorization"] = f"Bearer {token}"
+    elif auth_kind == "bearer_static":
+        kv_uri = get_env("KEYVAULT_URI")
+        secret_name = get_env(f"SECRET_{up}_BEARER", "")
+        token = kv_get_secret(kv_uri, secret_name) if kv_uri and secret_name else get_env(f"{up}_REST_BEARER_TOKEN", "")
+        if not token:
+            raise RuntimeError(f"[{up}] missing bearer token")
+        headers["Authorization"] = f"Bearer {token}"
+
+    s = requests.Session()
+    try:
+        r = s.request(method, url, headers=headers, data=body)
+        if r.status_code // 100 != 2:
+            raise RuntimeError(f"HTTP {r.status_code} {r.text[:300]}")
+        note = f"[{up}] REST call success ({method} {url})"
+        logging.info(note)
+        if snow and ritm_sys_id: snow.note(ritm_sys_id, note)
+        return True
+    except Exception as e:
+        err = f"[{up}] REST call failed: {e}"
+        logging.exception(err)
+        if snow and ritm_sys_id: snow.note(ritm_sys_id, err)
+        return False
+
+# ---------- Orchestrator ----------
+
+def process_row(cur, row: pyodbc.Row, snow: ServiceNowClient) -> None:
+    # Column names via settings
+    table = get_env("TABLE_NAME", "dbo.Assets")
+    id_field = get_env("ID_FIELD", "id")
+    vm_field = get_env("VM_FIELD", "vmname")
+    can_field = get_env("CAN_DELETE_FIELD", "can_be_deleted")
+    done_field = get_env("IBCLEANUP_FIELD", "ibcleanup")
+    del_field = get_env("DELETED_FIELD", "deleted")
+    ticket_field = get_env("SNOW_TICKET_FIELD", "snow_ticket")
+
+    rec_id = getattr(row, id_field)
+    vmname = getattr(row, vm_field)
+
+    # 1) Create RITM
+    short = f"Automated cleanup for {vmname}"
+    desc  = f"CloudReaper triggered cleanup for {vmname} at {datetime.datetime.utcnow().isoformat()}Z"
+    ritm_sys_id, ritm_number = snow.create_ritm(short, desc)
+    snow.note(ritm_sys_id, f"RITM created for {vmname}: {ritm_number}")
+
+    # Save ticket number to SQL
+    cur.execute(f"UPDATE {table} SET {ticket_field} = ? WHERE {id_field} = ?", ritm_number, rec_id)
+
+    # 2) Steps
+    ok_infoblox = do_infoblox(vmname, snow, ritm_sys_id)
+    ok_avd      = do_avd(vmname, snow, ritm_sys_id)
+    ok_entra    = do_generic_rest("entra", vmname, snow, ritm_sys_id) if get_env("ENTRA_MODE", "off") != "off" else True
+    ok_intune   = do_generic_rest("intune", vmname, snow, ritm_sys_id) if get_env("INTUNE_MODE", "off") != "off" else True
+
+    all_ok = ok_infoblox and ok_avd and ok_entra and ok_intune
+
+    # 3) Update SQL flags
+    # Always mark ibcleanup=1 (processed); set deleted=1 only if all aux succeeded
+    cur.execute(f"UPDATE {table} SET {done_field} = 1, {del_field} = ? WHERE {id_field} = ?", 1 if all_ok else 0, rec_id)
+
+    # 4) Close ticket if all OK
+    if all_ok:
+        snow.note(ritm_sys_id, f"All cleanup steps succeeded for {vmname}. Closing tasks and RITM.")
+        snow.close_tasks_and_ritm(ritm_sys_id, ok=True)
+    else:
+        snow.note(ritm_sys_id, f"One or more steps failed for {vmname}. Ticket left open for investigation.")
+
+def run_batch() -> None:
+    snow = ServiceNowClient()
+    table = get_env("TABLE_NAME", "dbo.Assets")
+    id_field = get_env("ID_FIELD", "id")
+    vm_field = get_env("VM_FIELD", "vmname")
+    can_field = get_env("CAN_DELETE_FIELD", "can_be_deleted")
+    done_field = get_env("IBCLEANUP_FIELD", "ibcleanup")
+    batch_size = int(get_env("BATCH_SIZE", "25"))
+
+    with sql_connect_msi() as con:
+        con.autocommit = False
+        cur = con.cursor()
+
+        # Pull batch
+        query = (
+            f"SELECT TOP ({batch_size}) {id_field}, {vm_field} "
+            f"FROM {table} WITH (ROWLOCK, READPAST) "
+            f"WHERE {can_field} = 1 AND {done_field} = 0"
+        )
+        rows = cur.execute(query).fetchall()
+        if not rows:
+            logging.info("No eligible rows to process.")
+            return
+
+        try:
+            for row in rows:
+                try:
+                    process_row(cur, row, snow)
+                except Exception as e:
+                    logging.exception("Failed processing row id=%s: %s", getattr(row, id_field, "?"), e)
+            con.commit()
+        except Exception:
+            con.rollback()
+            raise
+
+# ---------- Azure Function entry ----------
+
+def main(mytimer: func.TimerRequest) -> None:
+    utc_timestamp = datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc).isoformat()
+    if mytimer.past_due:
+        logging.warning("Timer is past due!")
+    logging.info("CloudReaper tick at %s", utc_timestamp)
+    try:
+        run_batch()
+    except Exception as e:
+        logging.exception("Batch failed: %s", e)
